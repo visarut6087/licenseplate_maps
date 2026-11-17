@@ -4,48 +4,103 @@ import re
 import threading
 from pathlib import Path
 
-from .config import MODEL, BASE_MODEL, DEVICE
+from .config import MODEL, BASE_MODEL, DEVICE, YOLO_CONF
 
 
 def parse_ocr(raw):
     text = raw.strip()
     match = re.search(r'\{.*\}', text, re.S)
-    if not match:
-        raise ValueError('OCR ไม่คืน JSON: ' + text[:160])
-    data = json.loads(match.group())
+    if match:
+        data = json.loads(match.group())
+    else:
+        data = {}
+        fields = {
+            'plate number': 'plate_number', 'plate_number': 'plate_number',
+            'characters': 'characters', 'digits': 'digits', 'province': 'province',
+        }
+        for line in text.splitlines():
+            clean = re.sub(r'[*#`]', '', line).strip()
+            item = re.match(r'([^:]+):\s*(.*)', clean)
+            if item and item.group(1).strip().lower() in fields:
+                data[fields[item.group(1).strip().lower()]] = item.group(2).strip()
     plate = str(data.get('plate_number') or '').strip()
     digits = str(data.get('digits') or '').strip()
+    characters = str(data.get('characters') or '').strip()
+    province = str(data.get('province') or '').strip()
     if not plate:
-        plate = (str(data.get('characters') or '') + digits).strip()
+        plate = (characters + digits).strip()
     if not plate:
         raise ValueError('OCR ไม่พบเลขทะเบียน')
+    # Some releases place the province in `characters`. Only recover it when that
+    # value is clearly not part of the returned plate number.
+    if not province and characters and characters.replace(' ', '') not in plate.replace(' ', ''):
+        province = characters
     trailing_digits = re.search(r'(\d+)\s*$', plate)
     return dict(plate_number=plate, digits=digits or (trailing_digits.group(1) if trailing_digits else ''),
-                province=str(data.get('province') or '').strip(), raw_text=raw)
+                province=province, raw_text=raw)
 
 
 class Pipeline:
     def __init__(self):
         self.ready = False
+        self.vision_ready = False
+        self.ocr_ready = False
         self.error = None
-        self.lock = threading.Lock()
-        self.loading = False
+        self.vision_error = None
+        self.ocr_error = None
+        self.vision_load_lock = threading.Lock()
+        self.ocr_load_lock = threading.Lock()
+        self.vision_lock = threading.Lock()
+        self.ocr_lock = threading.Lock()
+        self.vision_loading = False
+        self.ocr_loading = False
 
     def status(self):
-        return dict(ready=self.ready, loading=self.loading, error=self.error)
+        required = {
+            'detector': MODEL / 'weights/detector.pt',
+            'classifier': MODEL / 'classify/best.pt',
+            'ocr_base_model': Path(BASE_MODEL) / 'config.json',
+            'ocr_adapter_config': MODEL / 'ocr/adapter_config.json',
+            'ocr_adapter_weights': MODEL / 'ocr/adapter_model.safetensors',
+        }
+        return dict(ready=self.ready, loading=self.vision_loading or self.ocr_loading, error=self.error,
+                    stages={
+                        'vision': {'ready': self.vision_ready, 'loading': self.vision_loading, 'error': self.vision_error},
+                        'ocr': {'ready': self.ocr_ready, 'loading': self.ocr_loading, 'error': self.ocr_error},
+                    }, artifacts={name: path.is_file() for name, path in required.items()})
 
-    def load(self):
-        with self.lock:
-            if self.ready:
+    @staticmethod
+    def _require(paths):
+        missing = [path for path in paths if not path.is_file()]
+        if missing:
+            names = ', '.join(str(path.relative_to(MODEL.parent)) for path in missing)
+            raise FileNotFoundError(f'ไฟล์โมเดลยังไม่ครบ: {names}')
+
+    def validate_vision_artifacts(self):
+        self._require((
+            MODEL / 'weights/detector.pt',
+            MODEL / 'classify/best.pt',
+            MODEL / 'classify/class_map.json',
+        ))
+
+    def validate_ocr_artifacts(self):
+        self._require((
+            MODEL / 'ocr/adapter_config.json',
+            MODEL / 'ocr/adapter_model.safetensors',
+        ))
+        if not (Path(BASE_MODEL) / 'config.json').is_file():
+            raise FileNotFoundError('OCR base model ยังไม่อยู่ใน model/ocr-base')
+
+    def load_vision(self):
+        with self.vision_load_lock:
+            if self.vision_ready:
                 return
-            self.loading = True
+            self.vision_loading = True
             try:
+                self.validate_vision_artifacts()
                 import torch
                 from torchvision import models, transforms
                 from ultralytics import YOLO
-                from transformers import AutoModelForImageTextToText, AutoProcessor
-                from peft import PeftModel
-                from huggingface_hub import try_to_load_from_cache
                 self.torch = torch
                 self.device = ('cuda' if torch.cuda.is_available() else 'cpu') if DEVICE == 'auto' else DEVICE
                 self.detector = YOLO(str(MODEL / 'weights/detector.pt'))
@@ -65,31 +120,57 @@ class Pipeline:
                 self.labels = json.loads((MODEL / 'classify/class_map.json').read_text(encoding='utf-8'))
                 self.transform = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor(),
                     transforms.Normalize([.485, .456, .406], [.229, .224, .225])])
-                # No implicit multi-GB download during startup. Run download_models.py first.
-                self.processor = AutoProcessor.from_pretrained(str(MODEL / 'ocr'), local_files_only=True,
-                                                               use_fast=True, extra_special_tokens={})
-                if not Path(BASE_MODEL).is_dir():
-                    cached = [try_to_load_from_cache(BASE_MODEL, name) for name in
-                              ('model.safetensors', 'model.safetensors.index.json')]
-                    if not any(isinstance(path, str) and Path(path).is_file() for path in cached):
-                        raise FileNotFoundError('OCR base model ยังดาวน์โหลดไม่ครบ กรุณารัน .venv/Scripts/python.exe -m backend.download_models')
-                base = AutoModelForImageTextToText.from_pretrained(BASE_MODEL, local_files_only=True,
-                    dtype=torch.float16 if self.device.startswith('cuda') else torch.float32)
-                self.ocr = PeftModel.from_pretrained(base, str(MODEL / 'ocr')).to(self.device).eval()
-                self.ready, self.error = True, None
+                self.vision_ready, self.vision_error = True, None
+                self.ready = self.vision_ready and self.ocr_ready
             except Exception as exc:
-                self.error = f'{type(exc).__name__}: {exc}'
+                self.vision_error = f'{type(exc).__name__}: {exc}'
+                self.error = self.vision_error
                 raise
             finally:
-                self.loading = False
+                self.vision_loading = False
 
-    def run(self, frame):
+    def load_ocr(self):
+        with self.ocr_load_lock:
+            if self.ocr_ready:
+                return
+            self.ocr_loading = True
+            try:
+                self.validate_ocr_artifacts()
+                import torch
+                from transformers import AutoModelForImageTextToText, AutoProcessor
+                from peft import PeftModel
+                self.torch = torch
+                self.device = ('cuda' if torch.cuda.is_available() else 'cpu') if DEVICE == 'auto' else DEVICE
+                self.processor = AutoProcessor.from_pretrained(BASE_MODEL, local_files_only=True,
+                                                               use_fast=True, extra_special_tokens={})
+                # The 2B base model does not fit in memory as float32 on typical Windows hosts.
+                base = AutoModelForImageTextToText.from_pretrained(
+                    BASE_MODEL, local_files_only=True, dtype=torch.float16, low_cpu_mem_usage=True)
+                self.ocr = PeftModel.from_pretrained(base, str(MODEL / 'ocr')).to(self.device).eval()
+                self.ocr_ready, self.ocr_error = True, None
+                self.ready = self.vision_ready and self.ocr_ready
+                if self.ready:
+                    self.error = None
+            except Exception as exc:
+                self.ocr_error = f'{type(exc).__name__}: {exc}'
+                self.error = self.ocr_error
+                raise
+            finally:
+                self.ocr_loading = False
+
+    def load(self):
+        self.load_vision()
+        self.load_ocr()
+        self.ready = self.vision_ready and self.ocr_ready
+        self.error = None if self.ready else self.error
+
+    def detect(self, frame):
         import cv2
         from PIL import Image
-        self.load()
-        with self.lock, self.torch.inference_mode():
-            self.error = None
-            boxes = self.detector.predict(frame, conf=.45, device=self.device, verbose=False)[0].boxes
+        self.load_vision()
+        with self.vision_lock, self.torch.inference_mode():
+            self.vision_error = None
+            boxes = self.detector.predict(frame, conf=YOLO_CONF, device=self.device, verbose=False)[0].boxes
             if boxes is None or len(boxes) == 0:
                 return []
             full = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
@@ -105,18 +186,36 @@ class Pipeline:
                 if x2 <= x1 or y2 <= y1:
                     continue
                 crop = full.crop((x1, y1, x2, y2))
-                prompt = 'อ่านป้ายทะเบียนรถในภาพ ตอบ JSON เท่านั้น: {"plate_number":"", "characters":"", "digits":"", "province":""} ห้ามเดาข้อมูลที่มองไม่เห็น'
-                messages = [{'role': 'user', 'content': [{'type': 'image', 'image': crop}, {'type': 'text', 'text': prompt}]}]
-                inputs = self.processor.apply_chat_template(messages, tokenize=True, add_generation_prompt=True,
-                    return_dict=True, return_tensors='pt').to(self.device)
-                tokens = self.ocr.generate(**inputs, max_new_tokens=192, do_sample=False)
-                raw = self.processor.batch_decode(tokens[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)[0]
-                try:
-                    result = parse_ocr(raw)
-                    result.update(vehicle_type=vehicle_type, vehicle_probability=probability,
-                                  detector_probability=confidence, box=[x1, y1, x2, y2])
-                    results.append((result, crop))
-                except (ValueError, TypeError):
-                    # Report malformed OCR instead of turning model prose into a plate.
-                    self.error = 'OCR อ่านผลลัพธ์ไม่ได้: ' + raw[:160]
+                results.append((dict(vehicle_type=vehicle_type, vehicle_probability=probability,
+                                     detector_probability=confidence, box=[x1, y1, x2, y2]), crop))
             return results
+
+    def recognize(self, crop):
+        self.load_ocr()
+        with self.ocr_lock, self.torch.inference_mode():
+            self.ocr_error = None
+            prompt = 'อ่านป้ายทะเบียนรถในภาพ ตอบ JSON เท่านั้น: {"plate_number":"", "characters":"", "digits":"", "province":""} ห้ามเดาข้อมูลที่มองไม่เห็น'
+            messages = [{'role': 'user', 'content': [{'type': 'image', 'image': crop}, {'type': 'text', 'text': prompt}]}]
+            inputs = self.processor.apply_chat_template(messages, tokenize=True, add_generation_prompt=True,
+                return_dict=True, return_tensors='pt').to(self.device)
+            tokens = self.ocr.generate(**inputs, max_new_tokens=192, do_sample=False,
+                                       temperature=None, top_p=None, top_k=None)
+            raw = self.processor.batch_decode(tokens[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)[0]
+            try:
+                return parse_ocr(raw)
+            except (ValueError, TypeError):
+                self.ocr_error = 'OCR อ่านผลลัพธ์ไม่ได้: ' + raw[:160]
+                self.error = self.ocr_error
+                return None
+
+    def run(self, frame):
+        results = []
+        for vision, crop in self.detect(frame):
+            ocr = self.recognize(crop)
+            if ocr:
+                ocr.update(vision)
+                results.append((ocr, crop))
+        self.ready = self.vision_ready and self.ocr_ready
+        if results:
+            self.error = None
+        return results

@@ -1,0 +1,26 @@
+.video-timeline {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 2px 2px;
+}
+
+.video-seek {
+  width: 100%;
+  min-height: 32px;
+  padding: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.video-seek:disabled {
+  cursor: not-allowed;
+}
+
+.video-time {
+  min-width: 88px;
+  color: var(--muted);
+  font: 11px Consolas, monospace;
+  text-align: right;
+}

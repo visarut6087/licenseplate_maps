@@ -14,6 +14,7 @@ from .config import RESULTS
 class Storage:
     fields = ['order', 'id', 'detected_at', 'source_id', 'source_name', 'plate_number', 'digits',
               'province', 'vehicle_type', 'vehicle_probability', 'media_seconds', 'full_image', 'crop_image', 'json_file']
+    summary_fields = ['ลำดับ / เวลา', 'ทะเบียน / จังหวัด', 'ประเภทรถ', 'แหล่งภาพ']
 
     def __init__(self, root=RESULTS):
         self.root = Path(root)
@@ -73,3 +74,20 @@ class Storage:
                 temp = path.with_suffix('.tmp')
                 temp.write_text(self.csv_text(selected), encoding='utf-8-sig', newline='')
                 temp.replace(path)
+            summary = io.StringIO(newline='')
+            writer = csv.DictWriter(summary, fieldnames=self.summary_fields)
+            writer.writeheader()
+            with self.connect() as db:
+                rows = db.execute('SELECT payload FROM events ORDER BY sequence')
+                for row in rows:
+                    event = json.loads(row[0])
+                    writer.writerow({
+                        'ลำดับ / เวลา': f"#{event['order']} | {event['detected_at']}",
+                        'ทะเบียน / จังหวัด': f"{event['plate_number']} | {event.get('province') or 'ไม่ทราบจังหวัด'}",
+                        'ประเภทรถ': event['vehicle_type'],
+                        'แหล่งภาพ': event['source_name'],
+                    })
+            path = self.root / 'summary.csv'
+            temp = path.with_suffix('.tmp')
+            temp.write_text(summary.getvalue(), encoding='utf-8-sig', newline='')
+            temp.replace(path)

@@ -31,6 +31,11 @@ def test_evidence_pair_and_order_survive_restart(tmp_path):
     rows = list(csv.DictReader(io.StringIO((tmp_path / 'all.csv').read_text(encoding='utf-8-sig'))))
     assert [r['id'] for r in rows] == [first['id'], second['id']]
     assert len(list(csv.DictReader(io.StringIO((tmp_path / '2026-11-17/plates.csv').read_text(encoding='utf-8-sig'))))) == 1
+    summary = list(csv.DictReader(io.StringIO((tmp_path / 'summary.csv').read_text(encoding='utf-8-sig'))))
+    assert list(summary[0]) == ['ลำดับ / เวลา', 'ทะเบียน / จังหวัด', 'ประเภทรถ', 'แหล่งภาพ']
+    assert summary[0]['ทะเบียน / จังหวัด'] == 'กข1234 | กรุงเทพมหานคร'
+    assert summary[0]['ประเภทรถ'] == 'รถยนต'
+    assert summary[0]['แหล่งภาพ'] == 'ทางเข้า'
 
 
 def test_ocr_rejects_prose_and_supports_fenced_json():
@@ -39,6 +44,31 @@ def test_ocr_rejects_prose_and_supports_fenced_json():
     result = parse_ocr('```json\n{"plate_number":"กข1234", "province":"กรุงเทพมหานคร"}\n```')
     assert result['digits'] == '1234'
     assert parse_ocr('{"plate_number":"1กข 1234"}')['digits'] == '1234'
+    markdown = '**Plate Number:** กก 1234\n**Characters:** กก\n**Digits:** 1234\n**Province:** กรุงเทพมหานคร'
+    parsed = parse_ocr(markdown)
+    assert parsed['plate_number'] == 'กก 1234'
+    assert parsed['province'] == 'กรุงเทพมหานคร'
+    misplaced = parse_ocr('{"plate_number":"2ขย5548", "characters":"กรุงเทพมหานคร"}')
+    assert misplaced['province'] == 'กรุงเทพมหานคร'
+
+
+def test_model_status_reports_artifacts_without_loading(tmp_path, monkeypatch):
+    import backend.pipeline as module
+    (tmp_path / 'weights').mkdir()
+    (tmp_path / 'classify').mkdir()
+    (tmp_path / 'ocr').mkdir()
+    (tmp_path / 'weights/detector.pt').touch()
+    (tmp_path / 'classify/best.pt').touch()
+    (tmp_path / 'ocr/adapter_config.json').touch()
+    monkeypatch.setattr(module, 'MODEL', tmp_path)
+    monkeypatch.setattr(module, 'BASE_MODEL', str(tmp_path / 'ocr-base'))
+    status = Pipeline().status()
+    assert status['ready'] is False
+    assert status['artifacts']['detector'] is True
+    assert status['artifacts']['classifier'] is True
+    assert status['artifacts']['ocr_base_model'] is False
+    assert status['artifacts']['ocr_adapter_config'] is True
+    assert status['artifacts']['ocr_adapter_weights'] is False
 
 
 def test_api_and_path_guard(tmp_path, monkeypatch):
@@ -53,6 +83,7 @@ def test_api_and_path_guard(tmp_path, monkeypatch):
         assert client.post('/api/videos', files={'file':('x.mp4', b'', 'video/mp4')}).status_code == 422
         assert client.post('/api/videos', files={'file':('x.exe', b'xx')}).status_code == 422
         assert client.get('/api/sources/nope/frame').status_code == 404
+        assert client.post('/api/sources/nope/seek', json={'seconds': 10}).status_code == 404
         assert client.get('/api/results/index.sqlite3').status_code == 404
         assert client.get('/api/results/..%2F..%2FREADME.md').status_code == 404
         assert client.get('/api/export.csv').content.startswith(b'\xef\xbb\xbf')
@@ -62,7 +93,7 @@ def test_pipeline_order_full_frame_and_crop():
     torch = pytest.importorskip('torch')
     calls = []
     pipeline = Pipeline()
-    pipeline.ready = True
+    pipeline.ready = pipeline.vision_ready = pipeline.ocr_ready = True
     pipeline.torch, pipeline.device = torch, 'cpu'
     pipeline.labels = {'0':'รถยนต','1':'รถจักรยานยนต'}
     boxes = SimpleNamespace(xyxy=torch.tensor([[30, 20, 70, 40]]), conf=torch.tensor([.95]))
@@ -74,6 +105,8 @@ def test_pipeline_order_full_frame_and_crop():
         def predict(self, image, **kwargs):
             calls.append('detect')
             assert image.shape == (80, 120, 3)
+            from backend.config import YOLO_CONF
+            assert kwargs['conf'] == pytest.approx(YOLO_CONF)
             return [SimpleNamespace(boxes=Boxes())]
     pipeline.detector = Detector()
     def transform(image):
@@ -120,11 +153,14 @@ def test_mp4_capture_worker_and_evidence(tmp_path):
         writer.write(np.full((80, 120, 3), 100, dtype=np.uint8))
     writer.release()
     class StubPipeline:
-        error = None
-        def run(self, frame):
-            return [(dict(plate_number='ทด1234', digits='1234', province='กรุงเทพมหานคร',
-                          vehicle_type='รถยนต', vehicle_probability=.9, box=[10, 10, 50, 30]),
+        vision_error = ocr_error = None
+        def detect(self, frame):
+            return [(dict(vehicle_type='รถยนต', vehicle_probability=.9, box=[10, 10, 50, 30]),
                      Image.fromarray(cv2.cvtColor(frame[10:30, 10:50], cv2.COLOR_BGR2RGB)))]
+        def recognize(self, crop):
+            time.sleep(.1)
+            assert crop.size == (40, 20)
+            return dict(plate_number='ทด1234', digits='1234', province='กรุงเทพมหานคร')
     storage = Storage(tmp_path / 'results')
     manager = Manager(StubPipeline(), storage)
     try:
@@ -139,5 +175,65 @@ def test_mp4_capture_worker_and_evidence(tmp_path):
         assert events[0]['source_kind'] == 'video'
         assert events[0]['media_seconds'] is not None
         assert source.jpeg().startswith(b'\xff\xd8')
+        assert source.ocr_count() == 0
+        full = cv2.imread(str(tmp_path / 'results' / events[0]['full_image']))
+        saved_crop = cv2.imread(str(tmp_path / 'results' / events[0]['crop_image']))
+        assert full.shape[:2] == (80, 120)
+        assert saved_crop.shape[:2] == (20, 40)
+        assert source.duration_seconds > 0
+        assert manager.seek(source, .2) == pytest.approx(.2)
+        assert source.current_generation() == 1
+        deadline = time.monotonic() + 8
+        while source.status != 'finished' and time.monotonic() < deadline:
+            time.sleep(.05)
+        assert source.status == 'finished', source.error
+        assert source.media_seconds >= .19
     finally:
         manager.close()
+
+
+def test_seek_discards_ocr_result_from_old_video_position(tmp_path):
+    import threading
+    from backend.sources import Manager, Source
+
+    started, release = threading.Event(), threading.Event()
+
+    class SlowOCR:
+        vision_error = ocr_error = None
+
+        def recognize(self, crop):
+            started.set()
+            assert release.wait(3)
+            return dict(plate_number='กก1234', digits='1234', province='กรุงเทพมหานคร')
+
+    storage = Storage(tmp_path / 'results')
+    manager = Manager(SlowOCR(), storage)
+    source = Source('test.mp4', 'unused.mp4', 'video')
+    frame = np.zeros((80, 120, 3), dtype=np.uint8)
+    crop = Image.fromarray(np.zeros((20, 40, 3), dtype=np.uint8))
+    vision = dict(vehicle_type='รถยนต์', vehicle_probability=.9, box=[10, 10, 50, 30])
+    source.ocr_started()
+    manager.ocr_jobs.put((source, frame, crop, vision, '2026-11-17T10:00:00+07:00', 0.0, 0))
+    try:
+        assert started.wait(3)
+        source.request_seek(20)
+        release.set()
+        manager.ocr_jobs.join()
+        assert storage.list() == []
+        assert source.ocr_count() == 0
+    finally:
+        release.set()
+        manager.close()
+
+
+def test_tracking_ids_are_isolated_and_boxes_are_drawn():
+    from backend.sources import Source
+
+    source = Source('camera', 'rtsp://example', 'camera')
+    first = source.update_tracks([{'box': [10, 10, 50, 30], 'detector_probability': .91}])
+    second = source.update_tracks([{'box': [12, 10, 52, 30], 'detector_probability': .88}])
+    third = source.update_tracks([{'box': [70, 40, 110, 70], 'detector_probability': .80}])
+    assert first[0]['id'] == second[0]['id']
+    assert third[0]['id'] != first[0]['id']
+    annotated = source.annotate(np.zeros((80, 120, 3), dtype=np.uint8))
+    assert annotated.sum() > 0

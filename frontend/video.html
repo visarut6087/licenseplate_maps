@@ -6,7 +6,7 @@
   <meta name="description" content="ดูกล้อง IP และทดสอบวิดีโอ พร้อมภาพหลักฐานและประวัติทะเบียนรถ">
   <meta name="page-type" content="software"><meta name="site-kind" content="software">
   <meta name="theme-color" content="#101b24">
-  <link rel="stylesheet" href="styles.css"><script defer src="app.js"></script>
+  <link rel="stylesheet" href="styles.css"><link rel="stylesheet" href="filters.css"><link rel="stylesheet" href="video.css"><script defer src="app.js"></script>
 </head>
 <body>
 <a class="skip" href="#workspace">ข้ามไปพื้นที่ทำงาน</a>
@@ -28,7 +28,7 @@
         <div class="evidence-grid"><div><div class="image-label">ภาพเต็ม</div><div class="image-stage full-stage"><img id="full-image" alt="ภาพเต็มจากเหตุการณ์ที่เลือก" hidden><span id="full-empty">รอภาพที่ตรวจพบทะเบียน</span></div></div><div><div class="image-label">ป้ายทะเบียนจากภาพเดียวกัน</div><div class="image-stage crop-stage"><img id="crop-image" alt="ป้ายทะเบียนที่ตัดจากภาพเต็มเดียวกัน" hidden><span id="crop-empty">รอภาพป้ายทะเบียน</span></div></div></div>
         <div id="event-detail" class="event-detail"><span class="muted">เลือกทะเบียนในรายการเพื่อดูภาพคู่กัน</span></div>
       </section>
-      <section class="panel logs" aria-labelledby="log-heading"><div class="panel-head"><div><span class="section-number">03</span><h2 id="log-heading">ทะเบียนล่าสุด</h2><span id="log-count" class="badge">0 รายการ</span></div><a id="export-link" class="button secondary" download href="http://127.0.0.1:8000/api/export.csv">ดาวน์โหลด CSV</a></div><label class="filter">แสดงแหล่งภาพ<select id="source-filter"><option value="">ทั้งหมด</option></select></label><div class="table-wrap"><table><thead><tr><th>ลำดับ / เวลา</th><th>ทะเบียน / จังหวัด</th><th>ประเภทรถ</th><th>แหล่งภาพ</th></tr></thead><tbody id="log-body"></tbody></table><div id="empty-logs" class="empty"><p>ยังไม่มีทะเบียนที่อ่านได้</p><small>รายการใหม่จะแสดงที่นี่อัตโนมัติ</small></div></div></section>
+      <section class="panel logs" aria-labelledby="log-heading"><div class="panel-head"><div><span class="section-number">03</span><h2 id="log-heading">ทะเบียนล่าสุด</h2><span id="log-count" class="badge">0 รายการ</span></div><div><button id="clear-events" class="secondary" type="button">ล้างรายการ</button><a id="export-link" class="button secondary" download href="http://127.0.0.1:8000/api/export.csv">ดาวน์โหลด CSV</a></div></div><div class="log-filters"><label class="filter search-filter">ค้นหา<input id="event-search" type="search" placeholder="ทะเบียน จังหวัด ประเภทรถ หรือแหล่งภาพ" autocomplete="off"></label><label class="filter">แสดงแหล่งภาพ<select id="source-filter"><option value="">ทั้งหมด</option></select></label></div><div class="table-wrap"><table><thead><tr><th>ลำดับ / เวลา</th><th>ทะเบียน / จังหวัด</th><th>ประเภทรถ</th><th>แหล่งภาพ</th></tr></thead><tbody id="log-body"></tbody></table><div id="empty-logs" class="empty"><p>ยังไม่มีทะเบียนที่อ่านได้</p><small>รายการใหม่จะแสดงที่นี่อัตโนมัติ</small></div></div></section>
     </div>
   </div>
   <footer><span>บันทึกหลักฐานแยกตามวันที่ · เวลา Asia/Bangkok</span><button id="load-models" class="text-button">โหลด / ตรวจสอบโมเดล</button><span id="model-status">โมเดลยังไม่ถูกโหลด</span></footer>

@@ -1,10 +1,11 @@
 const API = localStorage.getItem('plate_api_url') || 'http://127.0.0.1:8000';
 const videoMode = location.pathname.endsWith('/video.html');
 const $ = id => document.getElementById(id);
-let sources = [], events = [], selected = null, busy = false, pinned = false;
+let sources = [], events = [], selected = null, busy = false, pinned = false, clearedThrough = 0;
 const cards = new Map();
-const statuses = {starting:'กำลังเปิด',running:'กำลังทำงาน',reconnecting:'กำลังเชื่อมต่อใหม่',finished:'เล่นจบแล้ว',stopped:'หยุดแล้ว',error:'เกิดข้อผิดพลาด'};
+const statuses = {starting:'กำลังเปิด',running:'กำลังทำงาน',seeking:'กำลังเลื่อนวิดีโอ',reconnecting:'กำลังเชื่อมต่อใหม่',finished:'เล่นจบแล้ว',stopped:'หยุดแล้ว',error:'เกิดข้อผิดพลาด'};
 const text = (tag, value, className) => {const el=document.createElement(tag);el.textContent=value;if(className)el.className=className;return el;};
+const formatTime = value => {const seconds=Math.max(0,Math.floor(Number(value)||0));const h=Math.floor(seconds/3600);const m=Math.floor(seconds%3600/60);const s=seconds%60;return h?`${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`:`${m}:${String(s).padStart(2,'0')}`;};
 async function api(path, options={}) {
   const response=await fetch(API+path,{...options,signal:AbortSignal.timeout(path==='/api/models/load'?600000:30000)});
   if(!response.ok){let error;try{error=(await response.json()).detail;}catch{error=response.statusText;}throw new Error(typeof error==='string'?error:JSON.stringify(error));}
@@ -20,6 +21,8 @@ $('camera-form').onsubmit=async e=>{e.preventDefault();const button=e.submitter;
 $('video-file').onchange=async()=>{const file=$('video-file').files[0];if(!file)return;const form=new FormData();form.append('file',file);$('add-source').disabled=true;notice('กำลังอัปโหลดวิดีโอ…');try{await api('/api/videos',{method:'POST',body:form});notice();await refresh();}catch(err){notice(err.message);}finally{$('add-source').disabled=false;$('video-file').value='';}};
 $('load-models').onclick=async()=>{$('load-models').disabled=true;$('model-status').textContent='กำลังโหลดโมเดล อาจใช้เวลาหลายนาที';try{await api('/api/models/load',{method:'POST'});notice();}catch(err){notice(err.message);}finally{$('load-models').disabled=false;await refresh();}};
 $('source-filter').onchange=()=>{selected=null;pinned=false;renderEvents();};
+$('event-search').oninput=()=>{selected=null;pinned=false;renderEvents();};
+$('clear-events').onclick=()=>{clearedThrough=Math.max(clearedThrough,...events.map(event=>Number(event.order)||0));selected=null;pinned=false;renderEvents();};
 function renderSources(){
   const visible=sources.filter(s=>s.kind===(videoMode?'video':'camera'));
   $('source-count').textContent=visible.length+' แหล่งภาพ';$('empty-sources').hidden=visible.length>0;
@@ -27,10 +30,11 @@ function renderSources(){
   for(const [id,card] of cards)if(!visible.some(s=>s.id===id)){card.remove();cards.delete(id);}
   for(const s of visible){
     let card=cards.get(s.id);
-    if(!card){card=text('article','','source-card');const meta=text('div','','source-meta');const label=text('div');label.append(text('strong',s.name),text('small','','state'));const stop=text('button','หยุด','secondary');stop.onclick=async()=>{try{await api('/api/sources/'+s.id,{method:'DELETE'});await refresh();}catch(err){notice(err.message);}};meta.append(label,stop);const img=document.createElement('img');img.alt='ภาพสด '+s.name;img.hidden=true;const wait=text('div','กำลังรอภาพ…','source-wait');const error=text('p','','error');card.append(meta,img,wait,error);cards.set(s.id,card);$('source-list').append(card);}
-    card.querySelector('.state').textContent=statuses[s.status]||s.status;
+    if(!card){card=text('article','','source-card');const meta=text('div','','source-meta');const label=text('div');label.append(text('strong',s.name),text('small','','state'));const stop=text('button','หยุด','secondary');stop.onclick=async()=>{try{await api('/api/sources/'+s.id,{method:'DELETE'});await refresh();}catch(err){notice(err.message);}};meta.append(label,stop);const img=document.createElement('img');img.alt='ภาพสด '+s.name;img.hidden=true;const wait=text('div','กำลังรอภาพ…','source-wait');const error=text('p','','error');card.append(meta,img,wait);if(videoMode){const timeline=text('div','','video-timeline');const range=document.createElement('input');range.type='range';range.className='video-seek';range.min='0';range.max='0';range.step='.1';range.value='0';range.setAttribute('aria-label','เลื่อนตำแหน่งวิดีโอ');const clock=text('span','0:00 / 0:00','video-time');range.oninput=()=>{range.dataset.dragging='1';clock.textContent=formatTime(range.value)+' / '+formatTime(range.max);};range.onchange=async()=>{range.disabled=true;try{await api('/api/sources/'+s.id+'/seek',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({seconds:Number(range.value)})});notice();}catch(err){notice(err.message);}finally{delete range.dataset.dragging;range.disabled=false;await refresh();}};timeline.append(range,clock);card.append(timeline);}card.append(error);cards.set(s.id,card);$('source-list').append(card);}
+    card.querySelector('.state').textContent=(statuses[s.status]||s.status)+(s.tracking?' · tracking '+s.tracking:'')+(s.ocr_queue?' · รอ OCR '+s.ocr_queue:'');
     card.querySelector('button').disabled=['stopped','finished'].includes(s.status);
     card.querySelector('.error').textContent=s.error||'';
+    if(videoMode){const range=card.querySelector('.video-seek'),clock=card.querySelector('.video-time');const duration=Math.max(0,Number(s.duration_seconds)||0);range.max=String(duration);range.disabled=!duration||s.status==='stopped';if(!range.dataset.dragging)range.value=String(Math.min(duration,Number(s.media_seconds)||0));clock.textContent=formatTime(range.value)+' / '+formatTime(duration);}
     if(s.frames>0)loadFrame(card,s);
   }
   const filter=$('source-filter'), old=filter.value;
@@ -53,8 +57,9 @@ function showEvent(event){
 }
 function renderEvents(){
   const kind=videoMode?'video':'camera';const allowed=new Set(sources.filter(s=>s.kind===kind).map(s=>s.id));
+  const query=$('event-search').value.trim().toLocaleLowerCase('th');
   // Saved events remain available after backend restart; filtering applies only to known sources.
-  const visible=events.filter(e=>(e.source_kind?e.source_kind===kind:(!sources.some(s=>s.id===e.source_id)||allowed.has(e.source_id)))&&(!$('source-filter').value||e.source_id===$('source-filter').value));
+  const visible=events.filter(e=>(Number(e.order)||0)>clearedThrough&&(e.source_kind?e.source_kind===kind:(!sources.some(s=>s.id===e.source_id)||allowed.has(e.source_id)))&&(!$('source-filter').value||e.source_id===$('source-filter').value)&&(!query||[e.plate_number,e.province,e.vehicle_type,e.source_name,e.order].join(' ').toLocaleLowerCase('th').includes(query)));
   $('log-count').textContent=visible.length+' รายการ';$('empty-logs').hidden=visible.length>0;
   $('log-body').replaceChildren(...visible.map(e=>{const row=document.createElement('tr');row.dataset.id=e.id;const order=text('td','#'+e.order);order.append(text('small',new Date(e.detected_at).toLocaleTimeString('th-TH',{timeZone:'Asia/Bangkok',hour12:false})));const plate=text('td');const button=text('button',e.plate_number);button.onclick=()=>{pinned=e.id!==visible[0]?.id;showEvent(e);};plate.append(button,text('small',e.province||'ไม่ทราบจังหวัด'));row.append(order,plate,text('td',e.vehicle_type),text('td',e.source_name));row.classList.toggle('selected',e.id===selected);return row;}));
   const current=(pinned&&visible.find(e=>e.id===selected))||visible[0];if(current)showEvent(current);

@@ -35,6 +35,10 @@ class CameraRequest(BaseModel):
     url: str = Field(min_length=1, max_length=2048)
 
 
+class SeekRequest(BaseModel):
+    seconds: float = Field(ge=0)
+
+
 def get_source(source_id):
     source = app.state.manager.sources.get(source_id)
     if source is None:
@@ -99,6 +103,16 @@ def stop_source(source_id: str):
     source = get_source(source_id)
     source.stop.set()
     source.status = 'stopped'
+    return source.public()
+
+
+@app.post('/api/sources/{source_id}/seek')
+def seek_source(source_id: str, body: SeekRequest):
+    source = get_source(source_id)
+    try:
+        app.state.manager.seek(source, body.seconds)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
     return source.public()
 
 
