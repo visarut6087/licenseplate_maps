@@ -1,0 +1,11 @@
+.venv/
+.python/
+.cache/
+__pycache__/
+.pytest_cache/
+results/
+uploads/
+.env
+.taste-skill/
+shots/
+model/ocr/*.safetensors
